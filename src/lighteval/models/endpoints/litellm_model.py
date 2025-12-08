@@ -439,7 +439,6 @@ class LiteLLMClient(LightevalModel):
         for attempt in range(self.API_MAX_RETRY):
             try:
                 response = litellm.completion(**kwargs)
-                content = response.choices[0].message.content
 
                 # Handle empty response with a single retry
                 if not response.choices or not response.choices[0].message.content:
