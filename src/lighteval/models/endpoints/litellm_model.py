@@ -27,7 +27,6 @@ from json import JSONDecodeError
 from typing import Any, List
 
 import requests
-from litellm import Choices, StreamingChoices
 from openai import PermissionDeniedError
 from tqdm import tqdm
 
@@ -44,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 if is_package_available("litellm"):
     import litellm
-    from litellm import encode, supports_reasoning
+    from litellm import Choices, StreamingChoices, encode, supports_reasoning
     from litellm.caching.caching import Cache, LiteLLMCacheType
     from litellm.utils import ModelResponse as LitellmModelResponse
     from litellm.utils import get_max_tokens
