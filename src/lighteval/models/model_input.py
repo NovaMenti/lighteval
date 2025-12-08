@@ -29,16 +29,12 @@ class GenerationParameters(BaseModel, extra="forbid"):
     block_size: NonNegativeInt | None = None  # transformers
 
     early_stopping: bool | None = None  # transformers
-    repetition_penalty: NonNegativeFloat | None = (
-        None  # vllm, transformers, tgi, sglang
-    )
+    repetition_penalty: NonNegativeFloat | None = None  # vllm, transformers, tgi, sglang
     frequency_penalty: NonNegativeFloat | None = None  # vllm, tgi, sglang
     length_penalty: NonNegativeFloat | None = None  # vllm, transformers
     presence_penalty: NonNegativeFloat | None = None  # vllm, sglang
 
-    max_new_tokens: NonNegativeInt | None = (
-        None  # vllm, transformers, tgi, litellm, sglang
-    )
+    max_new_tokens: NonNegativeInt | None = None  # vllm, transformers, tgi, litellm, sglang
     min_new_tokens: NonNegativeInt | None = None  # vllm, transformers, sglang
 
     seed: NonNegativeInt | None = None  # vllm, tgi, litellm
@@ -162,11 +158,7 @@ class GenerationParameters(BaseModel, extra="forbid"):
 
         # Task specific sampling params to set in model: n, best_of, use_beam_search
         # Generation specific params to set in model: logprobs, prompt_logprobs
-        x = {
-            sampling_params_to_vllm_naming.get(k, k): v
-            for k, v in self.model_dump().items()
-            if v is not None
-        }
+        x = {sampling_params_to_vllm_naming.get(k, k): v for k, v in self.model_dump().items() if v is not None}
         # VLLM max_tokens is 16 by default, however the pipeline expect the max_tokens to be None, if the user didn't specify it
         if not x.get("max_tokens"):
             x["max_tokens"] = None

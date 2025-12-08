@@ -24,11 +24,11 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from json import JSONDecodeError
-from typing import Any, List, Type
+from typing import Any, List
 
+import requests
 from litellm import Choices, StreamingChoices
 from openai import PermissionDeniedError
-import requests
 from tqdm import tqdm
 
 from lighteval.data import GenerativeTaskDataset
@@ -209,9 +209,7 @@ class LiteLLMClient(LightevalModel):
     def _prepare_response_format(self, response_format):
         """Prepare response format for API call."""
         if response_format is not None and BaseModel is not None:
-            if isinstance(response_format, type) and issubclass(
-                response_format, BaseModel
-            ):
+            if isinstance(response_format, type) and issubclass(response_format, BaseModel):
                 return response_format
         elif response_format == "json":
             return {"type": "json_object"}
@@ -235,7 +233,7 @@ class LiteLLMClient(LightevalModel):
                     else ""
                 )
                 logger.warning(
-                    f"TRUNCATION DETECTED: Response {i+1} was truncated due to token limit{native_info}. "
+                    f"TRUNCATION DETECTED: Response {i + 1} was truncated due to token limit{native_info}. "
                     f"max_new_tokens={max_new_tokens}, max_model_length={self.max_length}. "
                     f"Consider increasing max_new_tokens or max_model_length to ensure complete responses."
                 )
@@ -247,7 +245,7 @@ class LiteLLMClient(LightevalModel):
                     else ""
                 )
                 logger.warning(
-                    f"CONTENT FILTERED: Response {i+1} was filtered by content moderation{native_info}. "
+                    f"CONTENT FILTERED: Response {i + 1} was filtered by content moderation{native_info}. "
                     f"Response may be incomplete or missing. Review the prompt or model settings."
                 )
             elif finish_reason == "error":
@@ -258,7 +256,7 @@ class LiteLLMClient(LightevalModel):
                     else ""
                 )
                 logger.error(
-                    f"GENERATION ERROR: Response {i+1} encountered an error during generation{native_info}. "
+                    f"GENERATION ERROR: Response {i + 1} encountered an error during generation{native_info}. "
                     f"Response may be incomplete or missing. Check model/provider status."
                 )
             elif finish_reason == "tool_calls":
@@ -269,17 +267,13 @@ class LiteLLMClient(LightevalModel):
                     else ""
                 )
                 logger.info(
-                    f"TOOL CALLS: Response {i+1} stopped for tool/function calls{native_info}. "
+                    f"TOOL CALLS: Response {i + 1} stopped for tool/function calls{native_info}. "
                     f"This is unexpected if not using function calling."
                 )
             elif finish_reason and finish_reason != "stop":
                 # Unknown finish reason
-                native_info = (
-                    f" (native: {native_finish_reason})" if native_finish_reason else ""
-                )
-                logger.info(
-                    f"Response {i+1} finished with reason: {finish_reason}{native_info}"
-                )
+                native_info = f" (native: {native_finish_reason})" if native_finish_reason else ""
+                logger.info(f"Response {i + 1} finished with reason: {finish_reason}{native_info}")
 
     def _classify_error(self, error: Exception, attempt: int) -> dict:
         """Classify error and determine retry strategy.
@@ -384,21 +378,15 @@ class LiteLLMClient(LightevalModel):
             "log_func": logger.error,
         }
 
-    def __call_api(
-        self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence
-    ):  # noqa: C901
+    def __call_api(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence):  # noqa: C901
         """Make API call with retries, supporting Pydantic models in response_format and comprehensive error handling."""
         response = LitellmModelResponse()
         stop_sequence = self._prepare_stop_sequence(stop_sequence)
         max_new_tokens = self._prepare_max_new_tokens(max_new_tokens)
-        response_format = self._prepare_response_format(
-            self.generation_parameters.response_format
-        )
+        response_format = self._prepare_response_format(self.generation_parameters.response_format)
 
         if return_logits and not self.provider == "openai":
-            logger.warning(
-                "Returning logits is not supported for this provider, ignoring."
-            )
+            logger.warning("Returning logits is not supported for this provider, ignoring.")
 
         # Prepare kwargs for completion call
         kwargs = {
@@ -416,23 +404,17 @@ class LiteLLMClient(LightevalModel):
         }
 
         if "o1" in self.model:
-            logger.warning(
-                "O1 models do not support temperature, top_p, stop sequence. Disabling."
-            )
+            logger.warning("O1 models do not support temperature, top_p, stop sequence. Disabling.")
         else:
             kwargs.update(self.generation_parameters.to_litellm_dict())
 
         if kwargs.get("max_completion_tokens", None) is None:
             kwargs["max_completion_tokens"] = max_new_tokens
 
-        if self.openrouter_provider_order and (
-            self.provider == "openrouter" or self.model.startswith("openrouter/")
-        ):
+        if self.openrouter_provider_order and (self.provider == "openrouter" or self.model.startswith("openrouter/")):
             kwargs["extra_body"] = {
                 "provider": {
-                    "only": list(
-                        self.openrouter_provider_order
-                    )  # Copy list to avoid mutation issues
+                    "only": list(self.openrouter_provider_order)  # Copy list to avoid mutation issues
                 }
             }
 
@@ -448,14 +430,10 @@ class LiteLLMClient(LightevalModel):
 
                     # Check again after retry
                     if not response.choices or not response.choices[0].message.content:
-                        logger.warning(
-                            "Response still empty after retry without caching"
-                        )
+                        logger.warning("Response still empty after retry without caching")
                         return LitellmModelResponse()
 
-                self._check_finish_reason(
-                    response.choices, max_new_tokens=max_new_tokens
-                )
+                self._check_finish_reason(response.choices, max_new_tokens=max_new_tokens)
 
                 return response
 
@@ -463,9 +441,7 @@ class LiteLLMClient(LightevalModel):
                 error_action = self._classify_error(e, attempt)
 
                 if error_action["should_retry"]:
-                    wait_time = min(
-                        64, self.API_RETRY_SLEEP * (self.API_RETRY_MULTIPLIER**attempt)
-                    )
+                    wait_time = min(64, self.API_RETRY_SLEEP * (self.API_RETRY_MULTIPLIER**attempt))
                     error_action["log_func"](
                         f"{error_action['message']} "
                         f"Error: {str(e)}, waiting {wait_time} seconds before retry {attempt + 1}/{self.API_MAX_RETRY}"
@@ -478,9 +454,7 @@ class LiteLLMClient(LightevalModel):
                     )
                     return LitellmModelResponse()
 
-        logger.error(
-            f"All {self.API_MAX_RETRY} retry attempts exhausted. Returning empty response."
-        )
+        logger.error(f"All {self.API_MAX_RETRY} retry attempts exhausted. Returning empty response.")
         return LitellmModelResponse()
 
     def __call_api_parallel(
@@ -493,29 +467,15 @@ class LiteLLMClient(LightevalModel):
     ):
         results = []
 
-        return_logitss = (
-            [return_logits for _ in prompts]
-            if not isinstance(return_logits, list)
-            else return_logits
-        )
-        max_new_tokenss = (
-            [max_new_tokens for _ in prompts]
-            if not isinstance(max_new_tokens, list)
-            else max_new_tokens
-        )
-        num_sampless = (
-            [num_samples for _ in prompts]
-            if not isinstance(num_samples, list)
-            else num_samples
-        )
+        return_logitss = [return_logits for _ in prompts] if not isinstance(return_logits, list) else return_logits
+        max_new_tokenss = [max_new_tokens for _ in prompts] if not isinstance(max_new_tokens, list) else max_new_tokens
+        num_sampless = [num_samples for _ in prompts] if not isinstance(num_samples, list) else num_samples
         stop_sequencess = [stop_sequence for _ in prompts]
         assert (
-            len(prompts)
-            == len(return_logitss)
-            == len(max_new_tokenss)
-            == len(num_sampless)
-            == len(stop_sequencess)
-        ), f"Length of prompts, return_logitss, max_new_tokenss, num_sampless, stop_sequences, system_prompts should be the same but are {len(prompts)}, {len(return_logitss)}, {len(max_new_tokenss)}, {len(num_sampless)}, {len(stop_sequencess)}"
+            len(prompts) == len(return_logitss) == len(max_new_tokenss) == len(num_sampless) == len(stop_sequencess)
+        ), (
+            f"Length of prompts, return_logitss, max_new_tokenss, num_sampless, stop_sequences, system_prompts should be the same but are {len(prompts)}, {len(return_logitss)}, {len(max_new_tokenss)}, {len(num_sampless)}, {len(stop_sequencess)}"
+        )
 
         with ThreadPoolExecutor(self.concurrent_requests) as executor:
             for entry in tqdm(
@@ -532,17 +492,13 @@ class LiteLLMClient(LightevalModel):
                 results.append(entry)
 
         if None in results:
-            raise ValueError(
-                "Some entries are not annotated due to errors in annotate_p, please inspect and retry."
-            )
+            raise ValueError("Some entries are not annotated due to errors in annotate_p, please inspect and retry.")
 
         return results
 
     def estimate_context_length(self) -> int:
         def fallback():
-            logger.warning(
-                "Failed to fetch model endpoint info from OpenRouter, returning default max length."
-            )
+            logger.warning("Failed to fetch model endpoint info from OpenRouter, returning default max length.")
             return self._DEFAULT_MAX_LENGTH
 
         # If the model is used through openrouter, the actual model name comes after the prefix
@@ -585,9 +541,7 @@ class LiteLLMClient(LightevalModel):
         Returns:
             list[ModelResponse]: list of generated responses.
         """
-        dataset = GenerativeTaskDataset(
-            requests=docs, num_dataset_splits=self.DATASET_SPLITS
-        )
+        dataset = GenerativeTaskDataset(requests=docs, num_dataset_splits=self.DATASET_SPLITS)
         results = []
 
         for split in tqdm(
@@ -608,17 +562,12 @@ class LiteLLMClient(LightevalModel):
                     "num_samples > 1 is not supported with temperature=0, please set temperature > 0 or use non sampling metrics."
                 )
 
-            responses = self.__call_api_parallel(
-                contexts, return_logits, max_new_tokens, num_samples, stop_sequence
-            )
+            responses = self.__call_api_parallel(contexts, return_logits, max_new_tokens, num_samples, stop_sequence)
 
             for response, context in zip(responses, contexts):
-                result: list[str] = [
-                    choice.message.content for choice in response.choices
-                ]
+                result: list[str] = [choice.message.content for choice in response.choices]
                 reasonings: list[str | None] = [
-                    getattr(choice.message, "reasoning_content", None)
-                    for choice in response.choices
+                    getattr(choice.message, "reasoning_content", None) for choice in response.choices
                 ]
 
                 cur_response = ModelResponse(
