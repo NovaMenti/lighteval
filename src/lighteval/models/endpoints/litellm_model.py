@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 if is_package_available("litellm"):
     import litellm
-    from litellm import Choices, StreamingChoices, encode, supports_reasoning
+    from litellm import encode, supports_reasoning
     from litellm.caching.caching import Cache, LiteLLMCacheType
     from litellm.utils import ModelResponse as LitellmModelResponse
     from litellm.utils import get_max_tokens
@@ -57,8 +57,6 @@ else:
 
     litellm = Mock()
     encode = Mock()
-    Choices = Mock()
-    StreamingChoices = Mock()
     LitellmModelResponse = Mock()
 
 try:
@@ -220,7 +218,7 @@ class LiteLLMClient(LightevalModel):
 
     def _check_finish_reason(
         self,
-        choices: List[Choices | StreamingChoices] | Any,
+        choices,
         max_new_tokens: int = None,
     ) -> None:
         # Check for finish_reason issues and log appropriate warnings/errors
