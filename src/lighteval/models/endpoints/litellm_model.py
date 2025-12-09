@@ -376,25 +376,56 @@ class LiteLLMClient(LightevalModel):
         }
 
     def _validate_response_format(self, response: str, response_format: BaseModel | None):
-        if response_format is not None and issubclass(response_format, BaseModel):
-            import re
+        """
+        Validate and parse response according to the specified Pydantic model.
 
-            cleaned_text = response.strip()
-            if cleaned_text.startswith("```") or cleaned_text.endswith("```"):
-                cleaned_text = re.sub(r"^```(?:json)?\s*", "", cleaned_text, flags=re.MULTILINE)
-                cleaned_text = re.sub(r"\s*```\s*$", "", cleaned_text, flags=re.MULTILINE)
+        Args:
+            response (str): The raw response text from the model.
+            response_format (BaseModel | None): The Pydantic model class to validate against
 
-            try:
-                parsed_json = json.loads(cleaned_text)
-                response_format.model_validate(parsed_json)
-            except (json.JSONDecodeError, ValidationError) as e:
-                logger.error(
-                    f"Response format validation failed. Expected format: {response_format.__name__}. Error: {e}"
-                )
-                raise e
-            except Exception as e:
-                logger.error(f"Unexpected error during response format validation: {e}")
-                raise e
+        Raises:
+            json.JSONDecodeError: If the response is not valid JSON.
+            ValidationError: If the response doesn't match the Pydantic model schema.
+        """
+        # Return raw response if no validation is needed
+        if (
+            response_format is None
+            or not isinstance(response_format, type)
+            or not issubclass(response_format, BaseModel)
+        ):
+            return
+
+        import re
+
+        # Clean markdown code blocks
+        cleaned_text = response.strip()
+        if cleaned_text.startswith("```") or cleaned_text.endswith("```"):
+            # Remove opening code fence (with optional language specifier)
+            cleaned_text = re.sub(r"^```(?:json|JSON)?\s*\n?", "", cleaned_text, flags=re.MULTILINE)
+            # Remove closing code fence
+            cleaned_text = re.sub(r"\n?\s*```\s*$", "", cleaned_text, flags=re.MULTILINE)
+            cleaned_text = cleaned_text.strip()
+
+        try:
+            parsed_json = json.loads(cleaned_text)
+            response_format.model_validate(parsed_json)
+        except json.JSONDecodeError as e:
+            logger.error(
+                f"Response format validation failed - invalid JSON. "
+                f"Expected format: {response_format.__name__}. "
+                f"Error: {e}. Response excerpt: {cleaned_text[:200]}"
+            )
+            raise
+        except ValidationError as e:
+            logger.error(
+                f"Response format validation failed - schema mismatch. "
+                f"Expected format: {response_format.__name__}. "
+                f"Error: {e}"
+            )
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error during response format validation: {type(e).__name__}: {e}")
+            raise
 
     def __call_api(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence):  # noqa: C901
         """Make API call with retries, supporting Pydantic models in response_format and comprehensive error handling."""
@@ -451,8 +482,9 @@ class LiteLLMClient(LightevalModel):
                         logger.warning("Response still empty after retry without caching")
                         return LitellmModelResponse()
 
-                self._validate_response_format(response.choices[0].message.content, response_format)
                 self._check_finish_reason(response.choices, max_new_tokens=max_new_tokens)
+
+                self._validate_response_format(response.choices[0].message.content, response_format)
 
                 return response
 

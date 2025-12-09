@@ -494,7 +494,7 @@ class JudgeLM:
                     native_info = f" (native: {native_finish_reason})" if native_finish_reason else ""
                     logger.info(f"Response {i + 1} finished with reason: {finish_reason}{native_info}")
 
-        def _clean_response(text: str) -> str | BaseModel:
+        def _validate_response_format(response: str):
             if (
                 self.response_format is not None
                 and isinstance(self.response_format, type)
@@ -504,23 +504,39 @@ class JudgeLM:
                 import re
 
                 # Strip markdown code blocks if present
-                cleaned_text = text.strip()
-                if "```" in cleaned_text:
-                    cleaned_text = re.sub(r"^```(?:json)?\s*", "", cleaned_text, flags=re.MULTILINE)
-                    cleaned_text = re.sub(r"\s*```\s*$", "", cleaned_text, flags=re.MULTILINE)
+                cleaned_response = response.strip()
+                if cleaned_response.startswith("```") or cleaned_response.endswith("```"):
+                    # Remove opening code fence (with optional language specifier)
+                    cleaned_response = re.sub(
+                        r"^```(?:json|JSON)?\s*\n?",
+                        "",
+                        cleaned_response,
+                        flags=re.MULTILINE,
+                    )
+                    # Remove closing code fence
+                    cleaned_response = re.sub(r"\n?\s*```\s*$", "", cleaned_response, flags=re.MULTILINE)
+                    cleaned_response = cleaned_response.strip()
 
                 try:
-                    parsed_json = json.loads(cleaned_text)
-                    validated_model = self.response_format.model_validate(parsed_json)
-                    return validated_model  # Return Pydantic model instead of string
-                except (json.JSONDecodeError, ValidationError) as e:
-                    logger.warning(f"Failed to parse structured response: {e}, returning raw text")
-                    return text
+                    parsed_json = json.loads(cleaned_response)
+                    self.response_format.model_validate(parsed_json)
+                except json.JSONDecodeError as e:
+                    logger.error(
+                        f"Response format validation failed - invalid JSON. "
+                        f"Expected format: {self.response_format.__name__}. "
+                        f"Error: {e}. Response excerpt: {cleaned_response[:200]}"
+                    )
+                    raise
+                except ValidationError as e:
+                    logger.error(
+                        f"Response format validation failed - schema mismatch. "
+                        f"Expected format: {self.response_format.__name__}. "
+                        f"Error: {e}"
+                    )
+                    raise
                 except Exception as e:
-                    logger.warning(f"Unexpected error during response validation: {e}, returning raw text")
-                    return text
-            else:
-                return text
+                    logger.error(f"Unexpected error during response format validation: {type(e).__name__}: {e}")
+                    raise
 
         def __call_api(prompt):
             error_message = "ERROR: Failed to get response from the API."
@@ -549,15 +565,15 @@ class JudgeLM:
                         logger.info(f"Retrying without caching for prompt: {prompt[:100]}...")
                         retry_kwargs = {**kwargs, "caching": False}
                         response = litellm.completion(**retry_kwargs)
-                        text = _clean_response(response.choices[0].message.content)
+                        text = _validate_response_format(response.choices[0].message.content)
                         if not text or text == error_message:
                             # Just return None if the second attempt fails too
                             logger.error(f"Failed to get response from the API for prompt: {prompt[:100]}...")
                             return None
 
                     _check_finish_reason(response.choices)
-                    cleaned_text = _clean_response(text)
-                    return cleaned_text
+                    _validate_response_format(text)
+                    return text
                 except Exception as e:
                     error_action = _classify_error(e, attempt)
                     if error_action["should_retry"]:
