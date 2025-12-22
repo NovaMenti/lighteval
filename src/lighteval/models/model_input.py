@@ -51,7 +51,7 @@ class GenerationParameters(BaseModel, extra="forbid"):
 
     # response format to be followed by the model,
     # more info here https://platform.openai.com/docs/api-reference/chat/create#chat-create-response_format
-    response_format: str | None = None  # inference_providers
+    response_format: str | type[BaseModel] | None = None  # inference_providers
 
     @classmethod
     def from_dict(cls, config_dict: dict):
@@ -118,6 +118,7 @@ class GenerationParameters(BaseModel, extra="forbid"):
             "seed": self.seed,
             "repetition_penalty": self.repetition_penalty,
             "frequency_penalty": self.frequency_penalty,
+            "response_format": self.response_format,  # Include response_format for structured outputs (e.g., Pydantic models)
         }
         return {k: v for k, v in args.items() if v is not None}
 

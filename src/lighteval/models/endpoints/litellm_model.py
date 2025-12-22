@@ -20,12 +20,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from json import JSONDecodeError
 
 import requests
+from openai import PermissionDeniedError
+from pydantic import BaseModel, ValidationError
 from tqdm import tqdm
 
 from lighteval.data import GenerativeTaskDataset
@@ -102,6 +105,10 @@ class LiteLLMModelConfig(ModelConfig):
         system_prompt (str | None, optional, defaults to None): Optional system prompt to be used with chat models.
             This prompt sets the behavior and context for the model during evaluation.
         cache_dir (str, optional, defaults to "~/.cache/huggingface/lighteval"): Directory to cache the model.
+        openrouter_provider_order (list[str] | None, optional, defaults to None): For OpenRouter provider, restricts
+            requests to ONLY the specified providers (e.g., ["parasail"]). This uses OpenRouter's "only" field to
+            prevent fallback to other providers. Only used when provider is "openrouter" or model starts with "openrouter/".
+
 
     Example:
         ```python
@@ -131,6 +138,8 @@ class LiteLLMModelConfig(ModelConfig):
     api_retry_multiplier: float = 2.0
     timeout: float | None = None
 
+    openrouter_provider_order: list[str] | None = None
+
 
 @requires("litellm")
 class LiteLLMClient(LightevalModel):
@@ -154,12 +163,16 @@ class LiteLLMClient(LightevalModel):
         self.API_RETRY_MULTIPLIER = config.api_retry_multiplier
         self.timeout = config.timeout
 
+        self.openrouter_provider_order = config.openrouter_provider_order
+
         self._tokenizer = encode
         self.pairwise_tokenization = False
         litellm.drop_params = True
         litellm.verbose = config.verbose
         self.prompt_manager = PromptManager(
-            use_chat_template=True, tokenizer=self.tokenizer, system_prompt=config.system_prompt
+            use_chat_template=True,
+            tokenizer=self.tokenizer,
+            system_prompt=config.system_prompt,
         )
 
         # Initialize cache for tokenization and predictions
@@ -188,11 +201,238 @@ class LiteLLMClient(LightevalModel):
 
         return max_new_tokens
 
+    def _prepare_response_format(self, response_format):
+        """Prepare response format for API call."""
+        if response_format is not None and BaseModel is not None:
+            if isinstance(response_format, type) and issubclass(response_format, BaseModel):
+                return response_format
+        elif response_format == "json":
+            return {"type": "json_object"}
+        return {"type": "text"}
+
+    def _check_finish_reason(
+        self,
+        choices,
+        max_new_tokens: int = None,
+    ) -> None:
+        # Check for finish_reason issues and log appropriate warnings/errors
+        for i, choice in enumerate(choices):
+            finish_reason = getattr(choice, "finish_reason", None)
+            native_finish_reason = getattr(choice, "native_finish_reason", None)
+
+            if finish_reason == "length":
+                # Truncation: response incomplete due to token limit
+                native_info = (
+                    f" (native: {native_finish_reason})"
+                    if native_finish_reason and native_finish_reason != finish_reason
+                    else ""
+                )
+                logger.warning(
+                    f"TRUNCATION DETECTED: Response {i + 1} was truncated due to token limit{native_info}. "
+                    f"max_new_tokens={max_new_tokens}, max_model_length={self.max_length}. "
+                    f"Consider increasing max_new_tokens or max_model_length to ensure complete responses."
+                )
+            elif finish_reason == "content_filter":
+                # Content was filtered: response may be incomplete or missing
+                native_info = (
+                    f" (native: {native_finish_reason})"
+                    if native_finish_reason and native_finish_reason != finish_reason
+                    else ""
+                )
+                logger.warning(
+                    f"CONTENT FILTERED: Response {i + 1} was filtered by content moderation{native_info}. "
+                    f"Response may be incomplete or missing. Review the prompt or model settings."
+                )
+            elif finish_reason == "error":
+                # Error occurred: response likely incomplete or missing
+                native_info = (
+                    f" (native: {native_finish_reason})"
+                    if native_finish_reason and native_finish_reason != finish_reason
+                    else ""
+                )
+                logger.error(
+                    f"GENERATION ERROR: Response {i + 1} encountered an error during generation{native_info}. "
+                    f"Response may be incomplete or missing. Check model/provider status."
+                )
+            elif finish_reason == "tool_calls":
+                # Tool calls: normal for function calling, but unexpected here
+                native_info = (
+                    f" (native: {native_finish_reason})"
+                    if native_finish_reason and native_finish_reason != finish_reason
+                    else ""
+                )
+                logger.info(
+                    f"TOOL CALLS: Response {i + 1} stopped for tool/function calls{native_info}. "
+                    f"This is unexpected if not using function calling."
+                )
+            elif finish_reason and finish_reason != "stop":
+                # Unknown finish reason
+                native_info = f" (native: {native_finish_reason})" if native_finish_reason else ""
+                logger.info(f"Response {i + 1} finished with reason: {finish_reason}{native_info}")
+
+    def _classify_error(self, error: Exception, attempt: int) -> dict:
+        """Classify error and determine retry strategy.
+
+        Returns a dict with:
+            - should_retry: bool indicating if we should retry
+            - message: str error message prefix
+            - log_func: callable logger function (logger.error, logger.warning, etc.)
+            - hint: str optional hint for fixing the issue
+        """
+        error_type = type(error)
+
+        # Non-retryable errors (fail fast)
+        NON_RETRYABLE = {
+            litellm.ContentPolicyViolationError: {
+                "message": "CONTENT POLICY VIOLATION: Request blocked by provider content filters.",
+                "hint": "Failing fast and returning empty response.",
+                "log_func": logger.error,
+            },
+            litellm.ContextWindowExceededError: {
+                "message": f"CONTEXT WINDOW EXCEEDED: Input exceeds model context window (max_model_length={self.max_length}).",
+                "hint": "Reduce input size or increase max_model_length.",
+                "log_func": logger.error,
+            },
+            litellm.UnsupportedParamsError: {
+                "message": "UNSUPPORTED PARAMETERS: Invalid parameters passed to API.",
+                "hint": "Check model configuration.",
+                "log_func": logger.error,
+            },
+            litellm.AuthenticationError: {
+                "message": "AUTHENTICATION ERROR: Invalid API key or authentication failed.",
+                "hint": "Check API credentials.",
+                "log_func": logger.error,
+            },
+            PermissionDeniedError: {
+                "message": "PERMISSION DENIED: Insufficient permissions for this request.",
+                "hint": "Check API key permissions.",
+                "log_func": logger.error,
+            },
+            litellm.NotFoundError: {
+                "message": f"MODEL NOT FOUND: Invalid model name or model not available (Model: {self.model}).",
+                "hint": "Check model name.",
+                "log_func": logger.error,
+            },
+            litellm.UnprocessableEntityError: {
+                "message": "UNPROCESSABLE ENTITY: Request format is invalid.",
+                "hint": "Check request parameters.",
+                "log_func": logger.error,
+            },
+            litellm.BudgetExceededError: {
+                "message": "BUDGET EXCEEDED: API budget limit reached.",
+                "hint": "Check account budget settings.",
+                "log_func": logger.error,
+            },
+            litellm.BadRequestError: {
+                "message": "BAD REQUEST: Invalid request parameters.",
+                "hint": "Check request format and parameters.",
+                "log_func": logger.error,
+            },
+        }
+
+        # Special case: JSONSchemaValidationError - retry once
+        if error_type == litellm.JSONSchemaValidationError:
+            if attempt == 0:
+                return {
+                    "should_retry": True,
+                    "message": "JSON SCHEMA VALIDATION ERROR: Response does not match expected schema. Retrying once...",
+                    "log_func": logger.warning,
+                }
+            return {
+                "should_retry": False,
+                "message": "JSON SCHEMA VALIDATION ERROR: Response does not match expected schema.",
+                "hint": "This may indicate a model/provider issue.",
+                "log_func": logger.warning,
+            }
+
+        # Check non-retryable errors
+        if error_type in NON_RETRYABLE:
+            return {"should_retry": False, **NON_RETRYABLE[error_type]}
+
+        # Retryable errors (transient network/server issues)
+        RETRYABLE = {
+            litellm.Timeout: "TIMEOUT ERROR: Request timed out.",
+            litellm.RateLimitError: "RATE LIMIT ERROR: API rate limit exceeded.",
+            litellm.APIConnectionError: "API CONNECTION ERROR: Failed to connect to API.",
+            litellm.ServiceUnavailableError: "SERVICE UNAVAILABLE: API service is temporarily unavailable.",
+            litellm.InternalServerError: "INTERNAL SERVER ERROR: API server encountered an error.",
+            litellm.APIError: "API ERROR: Generic API error occurred.",
+            json.JSONDecodeError: "JSON DECODE ERROR: Failed to parse JSON response from API.",
+            ValidationError: "VALIDATION ERROR: Pydantic response validation failed.",
+        }
+
+        if error_type in RETRYABLE:
+            return {
+                "should_retry": True,
+                "message": RETRYABLE[error_type],
+                "log_func": logger.warning,
+            }
+
+        # Unknown exception - retry but log as error
+        return {
+            "should_retry": True,
+            "message": f"UNKNOWN ERROR: Unexpected exception type {error_type.__name__}.",
+            "log_func": logger.error,
+        }
+
+    def _validate_response_format(self, response: str, response_format: BaseModel | None):
+        """
+        Validate and parse response according to the specified Pydantic model.
+
+        Args:
+            response (str): The raw response text from the model.
+            response_format (BaseModel | None): The Pydantic model class to validate against
+
+        Raises:
+            json.JSONDecodeError: If the response is not valid JSON.
+            ValidationError: If the response doesn't match the Pydantic model schema.
+        """
+        # Return raw response if no validation is needed
+        if (
+            response_format is None
+            or not isinstance(response_format, type)
+            or not issubclass(response_format, BaseModel)
+        ):
+            return
+
+        import re
+
+        # Clean markdown code blocks
+        cleaned_text = response.strip()
+        if cleaned_text.startswith("```") or cleaned_text.endswith("```"):
+            # Remove opening code fence (with optional language specifier)
+            cleaned_text = re.sub(r"^```(?:json|JSON)?\s*\n?", "", cleaned_text, flags=re.MULTILINE)
+            # Remove closing code fence
+            cleaned_text = re.sub(r"\n?\s*```\s*$", "", cleaned_text, flags=re.MULTILINE)
+            cleaned_text = cleaned_text.strip()
+
+        try:
+            parsed_json = json.loads(cleaned_text)
+            response_format.model_validate(parsed_json)
+        except json.JSONDecodeError as e:
+            logger.error(
+                f"Response format validation failed - invalid JSON. "
+                f"Expected format: {response_format.__name__}. "
+                f"Error: {e}. Response excerpt: {cleaned_text[:200]}"
+            )
+            raise
+        except ValidationError as e:
+            logger.error(
+                f"Response format validation failed - schema mismatch. "
+                f"Expected format: {response_format.__name__}. "
+                f"Error: {e}"
+            )
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error during response format validation: {type(e).__name__}: {e}")
+            raise
+
     def __call_api(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence):  # noqa: C901
-        """Make API call with retries."""
+        """Make API call with retries, supporting Pydantic models in response_format and comprehensive error handling."""
         response = LitellmModelResponse()
         stop_sequence = self._prepare_stop_sequence(stop_sequence)
         max_new_tokens = self._prepare_max_new_tokens(max_new_tokens)
+        response_format = self._prepare_response_format(self.generation_parameters.response_format)
 
         if return_logits and not self.provider == "openai":
             logger.warning("Returning logits is not supported for this provider, ignoring.")
@@ -201,7 +441,7 @@ class LiteLLMClient(LightevalModel):
         kwargs = {
             "model": self.model,
             "messages": prompt,
-            "response_format": {"type": "text"},
+            "response_format": response_format,
             "max_tokens": max_new_tokens,
             "logprobs": return_logits if self.provider == "openai" else None,
             "stop": stop_sequence,
@@ -220,37 +460,52 @@ class LiteLLMClient(LightevalModel):
         if kwargs.get("max_completion_tokens", None) is None:
             kwargs["max_completion_tokens"] = max_new_tokens
 
+        if self.openrouter_provider_order and (self.provider == "openrouter" or self.model.startswith("openrouter/")):
+            kwargs["extra_body"] = {
+                "provider": {
+                    "only": list(self.openrouter_provider_order)  # Copy list to avoid mutation issues
+                }
+            }
+
         for attempt in range(self.API_MAX_RETRY):
             try:
                 response = litellm.completion(**kwargs)
-                content = response.choices[0].message.content
 
-                # If response is empty, retry without caching (maybe the error is recoverable and solved with a retry)
-                if not content:
+                # Handle empty response with a single retry
+                if not response.choices or not response.choices[0].message.content:
                     logger.info("Response is empty, retrying without caching")
-                    kwargs["caching"] = False
-                    response = litellm.completion(**kwargs)
-                    content = response.choices[0].message.content
+                    retry_kwargs = {**kwargs, "caching": False}
+                    response = litellm.completion(**retry_kwargs)
+
+                    # Check again after retry
+                    if not response.choices or not response.choices[0].message.content:
+                        logger.warning("Response still empty after retry without caching")
+                        return LitellmModelResponse()
+
+                self._check_finish_reason(response.choices, max_new_tokens=max_new_tokens)
+
+                self._validate_response_format(response.choices[0].message.content, response_format)
 
                 return response
-            except litellm.BadRequestError as e:
-                if "message" in e.__dict__:
-                    error_string = (
-                        "The response was filtered due to the prompt triggering Microsoft's content management policy"
-                    )
-                    if error_string in e.__dict__["message"]:
-                        logger.warning(f"{error_string}. Returning empty response.")
-                        return LitellmModelResponse()
-            except Exception as e:
-                wait_time = min(
-                    64, self.API_RETRY_SLEEP * (self.API_RETRY_MULTIPLIER**attempt)
-                )  # Exponential backoff with max 64s
-                logger.warning(
-                    f"Error in API call: {e}, waiting {wait_time} seconds before retry {attempt + 1}/{self.API_MAX_RETRY}"
-                )
-                time.sleep(wait_time)
 
-        logger.error(f"API call failed after {self.API_MAX_RETRY} attempts, returning empty response.")
+            except Exception as e:
+                error_action = self._classify_error(e, attempt)
+
+                if error_action["should_retry"]:
+                    wait_time = min(64, self.API_RETRY_SLEEP * (self.API_RETRY_MULTIPLIER**attempt))
+                    error_action["log_func"](
+                        f"{error_action['message']} "
+                        f"Error: {str(e)}, waiting {wait_time} seconds before retry {attempt + 1}/{self.API_MAX_RETRY}"
+                    )
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    error_action["log_func"](
+                        f"{error_action['message']} Error: {str(e)}. {error_action.get('hint', '')}"
+                    )
+                    return LitellmModelResponse()
+
+        logger.error(f"All {self.API_MAX_RETRY} retry attempts exhausted. Returning empty response.")
         return LitellmModelResponse()
 
     def __call_api_parallel(
